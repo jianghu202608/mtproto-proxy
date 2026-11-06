@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GCP 上搭建 Telegram MTProto 代理</title>
+<title>GCP 部署 Telegram MTProxy 完整指南（官方源码 + systemd）</title>
 <style>
 :root{
   --bg:#0d1117; --panel:#161b22; --border:#30363d;
@@ -47,164 +47,738 @@ strong{color:#fff}
 <body>
 <div class="wrap">
 <header class="site">
-<h1>✈️ GCP 上搭建 Telegram MTProto 代理</h1>
-<p class="sub">在自己的 GCP 虚拟机上用官方镜像搭一个 Telegram 专用代理：防火墙、Docker、secret、导入验证、运维与排障全记录（已脱敏，可公开）</p>
+<h1>✈️ GCP 部署 Telegram MTProxy 完整指南</h1>
+<p class="sub">官方源码编译 + systemd 部署实录：与 sing-box、HY2、Caddy 共存，TCP 8443 独立端口，GCP NAT 参数修复，客户端 Secret 独立存储，每日官方配置自动更新（已脱敏，可公开）</p>
 </header>
 
 <blockquote>
-<p>在自己的 GCP 虚拟机（Debian 12）上用官方 MTProxy 镜像搭一个 Telegram 专用代理：给自己和信得过的人多一条连 Telegram 的路。本文命令均在 Debian 12 上适用，照着从上往下执行即可。</p>
+<p>在已有 GCP Debian VPS 上部署 Telegram MTProxy，作为独立的 Telegram 专用代理服务。本方案采用 Telegram 官方 MTProxy 源码编译，使用 systemd 管理，不依赖 Docker 容器运行。本文 IP 均为示例值，请替换为你自己的。</p>
 </blockquote>
-<h2 id="_1">一、这是什么 / 先说清的几件事</h2>
+<h2 id="_1">一、部署目标</h2>
+<p>在已有 GCP Debian VPS 上部署 Telegram MTProxy，作为独立的 Telegram 专用代理服务。</p>
+<p>本方案采用 Telegram 官方 MTProxy 源码编译，使用 systemd 管理，不依赖 Docker 容器运行。</p>
+<p>主要目标：</p>
 <ul>
-<li><strong>MTProto 代理</strong>是 Telegram 官方协议的专用代理，只能代理 Telegram 流量，不能当通用代理用。官方软件由 Telegram 团队维护（TelegramMessenger/MTProxy），有现成的 Docker 镜像。</li>
-<li><strong>装在哪</strong>：自己的 GCP VM（本文以一台 Debian 12 的小机器为例）。它是独立的 Docker 容器，和机器上其他服务（比如已有的节点）互不影响，不用了删容器即净。</li>
-<li><strong>合规与成本</strong>：GCP 不禁止个人运行代理类软件。代理转发算普通出站流量——注意你实例的出站计费档位和免费额度，自己用离上限很远；<strong>真正的风险只有链接泄露被滥用刷流量</strong>，所以文中的 secret 只发给信得过的人，绝不公开。</li>
-<li><strong>资源占用</strong>：极小，常驻内存十几 MB，1 GB 内存的小机器也毫无压力。</li>
+<li>不影响现有 sing-box、HY2 和 Caddy。</li>
+<li>不占用已有 TCP 443 和 UDP 443。</li>
+<li>适配 GCP 公网 NAT 网络。</li>
+<li>适用于 GCP Always Free 小规格 VM。</li>
+<li>使用独立 Secret，降低凭证泄露影响。</li>
+<li>支持开机自动启动、异常自动重启。</li>
+<li>每天自动更新 Telegram 官方服务器配置。</li>
 </ul>
-<h2 id="_2">二、前置条件</h2>
-<ul>
-<li>一台能 SSH 登录的 GCP VM（Debian 12），有一个公网 IP</li>
-<li>你的账号对该 VM 有 sudo 权限，对 GCP 项目有改防火墙的权限</li>
-<li>本地装有 Telegram 客户端（手机或桌面均可）用于导入和验证</li>
-</ul>
-<h2 id="1gcp-443tcp">三、步骤 1：GCP 防火墙放行 443/TCP</h2>
-<p>代理监听 443 端口（借用 HTTPS 的常用端口，较不易被网络单独针对；注意这只是端口选择，协议本身并没有伪装成 HTTPS——真正的协议伪装是 Fake TLS，见第九节），先在云端放行。</p>
-<p><strong>控制台操作</strong>：GCP 控制台 → VPC 网络 → 防火墙 → 创建防火墙规则：</p>
-<ul>
-<li>名称：<code>allow-mtproto-443</code></li>
-<li>方向：入站；对匹配项执行的操作：允许</li>
-<li>目标：网络中的所有实例（或用目标标记只圈你的实例）</li>
-<li>来源 IPv4 范围：<code>0.0.0.0/0</code></li>
-<li>协议和端口：TCP，<code>443</code></li>
-</ul>
-<p><strong>或用 gcloud 命令</strong>（在本机装有 gcloud 的终端执行）：</p>
-<pre><code class="language-bash">gcloud compute firewall-rules create allow-mtproto-443 \
-  --allow tcp:443 --direction INGRESS --priority 1000 --network default
-</code></pre>
 <blockquote>
-<p>如果机器上 443 已被其他服务占用，换一个端口（比如 8443），后面所有出现 443 的地方同步替换，防火墙也放行对应端口。注意 Docker 映射写宿主机端口在前：换 8443 时是 <code>-p 8443:443</code>，链接里的 port 也写 8443。</p>
+<p>说明：本站早期版本是 Docker 镜像方案。官方镜像版本较旧，实际部署最终改用官方源码编译 + systemd，本文即为实际成功部署的记录。</p>
 </blockquote>
-<h2 id="2-docker">四、步骤 2：安装 Docker</h2>
-<p>SSH 登录 VM 后执行（已装 Docker 的跳过本节，用 <code>docker --version</code> 验证）：</p>
-<pre><code class="language-bash">curl -fsSL https://get.docker.com | sudo sh
-sudo systemctl enable --now docker
-docker --version
-</code></pre>
-<p>能输出版本号即安装成功。官方安装脚本会把 Docker 设为开机自启。</p>
-<h2 id="3-secret">五、步骤 3：生成 secret 并启动代理</h2>
-<p>先生成一个固定 secret（32 位十六进制）。<strong>固定 secret 的好处</strong>：代理链接由你自己拼，不依赖容器日志，重启也不变：</p>
-<pre><code class="language-bash">openssl rand -hex 16
-</code></pre>
-<p>把输出记下来（例如 <code>0123456789abcdef0123456789abcdef</code>，下文以 <code>&lt;SECRET&gt;</code> 代指）。再创建一个持久化数据卷（官方快速参考命令的标配）：</p>
-<pre><code class="language-bash">sudo docker volume create proxy-config
-</code></pre>
-<p>然后启动官方镜像：</p>
-<pre><code class="language-bash">sudo docker run -d --name mtproto --restart unless-stopped \
-  -v proxy-config:/data \
-  -e SECRET=&lt;SECRET&gt; \
-  -p 443:443 \
-  telegrammessenger/proxy
-</code></pre>
-<ul>
-<li><code>--restart unless-stopped</code>：机器重启后容器自动恢复</li>
-<li><code>-v proxy-config:/data</code>：把配置和 secret 持久化到数据卷，升级或重建容器不丢。用上面固定 SECRET 的方式其实本来就不丢，这条是和官方写法对齐的双保险；如果你选择不传 SECRET 让它自动生成，数据卷就是必须的了——否则重建容器 secret 会变，所有人的链接都要重发</li>
-<li>想给不同的人发不同的 secret（便于单独吊销），<code>-e SECRET=</code> 后面可以用英文逗号分隔多个 secret</li>
-<li>不写 <code>-e SECRET</code> 也能跑：容器会随机生成并在日志里打印链接，但重启后排查麻烦，不推荐</li>
-</ul>
-<p>确认容器起来了：</p>
-<pre><code class="language-bash">sudo docker ps
-</code></pre>
-<p>看到 <code>mtproto</code> 处于 <code>Up</code> 状态即可。</p>
-<h2 id="4-telegram">六、步骤 4：拼出代理链接并导入 Telegram</h2>
-<p>先在 VM 上查公网 IP：</p>
-<pre><code class="language-bash">curl -s ifconfig.me
-</code></pre>
-<p>代理链接格式（把 <code>&lt;公网IP&gt;</code> 和 <code>&lt;SECRET&gt;</code> 换成你的）：</p>
-<pre><code>tg://proxy?server=&lt;公网IP&gt;&amp;port=443&amp;secret=&lt;SECRET&gt;
-</code></pre>
-<p>同样的内容也有网页版链接，适合发给别人：</p>
-<pre><code>https://t.me/proxy?server=&lt;公网IP&gt;&amp;port=443&amp;secret=&lt;SECRET&gt;
-</code></pre>
-<p><strong>导入方法</strong>：</p>
-<ul>
-<li>手机 Telegram：直接点开 <code>tg://</code> 链接（或打开 t.me 链接），客户端会弹出「启用代理」确认框，点启用</li>
-<li>桌面 Telegram：设置 → 高级 → 网络与代理 → 添加代理 → 选 MTProto → 填服务器、端口、secret</li>
-</ul>
-<h2 id="5">七、步骤 5：验证</h2>
-<ol>
-<li>客户端里代理状态显示已连接（桌面版设置里能看到延迟毫秒数）</li>
-<li>随便给一个联系人发条消息、再打开一个频道拉新消息，能收发即通</li>
-<li>VM 上看一眼容器日志，没有报错刷屏即正常：</li>
-</ol>
-<pre><code class="language-bash">sudo docker logs --tail 20 mtproto
-</code></pre>
-<h2 id="_3">八、日常运维</h2>
-<h3 id="_4">每日定时重启（官方建议，重要）</h3>
-<p>官方镜像说明里有一条容易被漏掉的建议：<strong>代理只在容器启动时拉取一次 Telegram 核心服务器的地址，官方建议约每天重启一次容器保鲜</strong>。<code>--restart unless-stopped</code> 只管崩溃和开机恢复，不做这件事，需要单独加一条定时任务（每天凌晨 4 点重启，秒级中断，基本无感）：</p>
-<pre><code class="language-bash">echo '0 4 * * * root /usr/bin/docker restart mtproto &gt;/dev/null 2&gt;&amp;1' | sudo tee /etc/cron.d/mtproto-restart &gt;/dev/null
-</code></pre>
-<p>验证已写入：<code>cat /etc/cron.d/mtproto-restart</code>。哪天想取消，删掉这个文件即可（卸载一节也会提到）。</p>
-<h3 id="_5">命令速查</h3>
-<pre><code class="language-bash">sudo docker ps                          # 看状态
-sudo docker logs -f mtproto             # 实时日志（Ctrl+C 退出）
-sudo docker restart mtproto             # 手动重启（顺带刷新核心服务器地址）
-sudo docker stop mtproto                # 暂停代理
-sudo docker start mtproto               # 恢复代理
-</code></pre>
-<p><strong>换 secret</strong>：删容器后用新 secret 重跑第五节的启动命令，数据卷保留不用重建，然后把新链接发给使用者：</p>
-<pre><code class="language-bash">sudo docker rm -f mtproto
-</code></pre>
-<p><strong>更新镜像</strong>：</p>
-<pre><code class="language-bash">sudo docker pull telegrammessenger/proxy
-sudo docker rm -f mtproto
-# 再执行第五节的启动命令（secret 和数据卷都在，不用重配）
-</code></pre>
-<h2 id="fake-tls">九、进阶（可选，了解即可）：随机填充与 Fake TLS</h2>
-<p>基础版 secret 是纯随机串，流量特征就是 MTProto。有两个进阶抗探测选项，先说清它们的真实状态，避免照错资料踩空：</p>
-<ul>
-<li><strong>随机填充（dd 前缀）</strong>：把 secret 改成以 <code>dd</code> 开头（<code>dd</code> + 原来的 32 位随机串），客户端发送时会给流量加随机填充，抗流量分析。这是协议层选项，改 secret 后所有客户端要换新链接，其他配置不用动。</li>
-<li><strong>Fake TLS（ee 前缀）</strong>：让连接看起来像访问某个正常网站的 TLS 流量，secret 形式为 <code>ee</code> + 随机部分 + 目标域名的十六进制编码。<strong>但要注意：官方 Docker 镜像的文档并不收录这种用法</strong>，它属于 MTProxy 程序本身及第三方实现（如 Telemt）的功能，配置也更复杂。本文基于官方镜像，就不给出 Fake TLS 的具体命令了——真要上，建议换源码版或第三方镜像再单独操作，别拿镜像版硬套。</li>
-</ul>
-<h2 id="_6">十、排障速查</h2>
+<h2 id="_2">二、服务器环境</h2>
+<p>实际部署环境：</p>
 <table>
 <thead>
 <tr>
-<th>现象</th>
-<th>先查什么</th>
+<th>项目</th>
+<th>配置</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>客户端一直「连接中」</td>
-<td>GCP 防火墙 443 是否放行；<code>sudo docker ps</code> 容器是否 Up；公网 IP 是否填对</td>
+<td>云平台</td>
+<td>Google Cloud Platform</td>
 </tr>
 <tr>
-<td>容器起不来 / 反复重启</td>
-<td><code>sudo docker logs mtproto</code> 看报错；多半是 secret 格式不对（必须是 32 位十六进制）</td>
+<td>操作系统</td>
+<td>Debian GNU/Linux 12 Bookworm</td>
 </tr>
 <tr>
-<td>443 被占用导致启动失败</td>
-<td><code>sudo ss -tlnp \| grep 443</code> 看谁在占用，换端口并同步改防火墙和链接</td>
+<td>架构</td>
+<td>x86_64</td>
 </tr>
 <tr>
-<td>导入链接没反应</td>
-<td>检查链接参数：server 是公网 IP 不是内网 IP；secret 有没有多空格或漏字符</td>
+<td>CPU</td>
+<td>2 vCPU（共享型）</td>
 </tr>
 <tr>
-<td>能连上但发不出消息</td>
-<td>看日志有无异常；重启一次容器刷新核心服务器地址</td>
+<td>内存</td>
+<td>约 1GB</td>
+</tr>
+<tr>
+<td>系统磁盘</td>
+<td>30GB</td>
+</tr>
+<tr>
+<td>Swap</td>
+<td>512MB</td>
+</tr>
+<tr>
+<td>Docker</td>
+<td>29.9.3，已安装但不用于运行 MTProxy</td>
+</tr>
+<tr>
+<td>MTProxy</td>
+<td>Telegram 官方源码编译</td>
+</tr>
+<tr>
+<td>编译提交</td>
+<td>69f2f08</td>
 </tr>
 </tbody>
 </table>
-<h2 id="_7">十一、费用提醒（建议顺手做）</h2>
-<p>在 GCP 账单里设一个预算提醒兜底：控制台 → 结算 → 预算和提醒 → 创建预算，金额设一个小额（比如 $1），超阈值发邮件。这样万一链接泄露被滥用刷流量，你能第一时间收到通知，回来换 secret 止损。</p>
-<h2 id="_8">十二、卸载（不想要了，干净清除）</h2>
-<pre><code class="language-bash">sudo docker rm -f mtproto
-sudo docker volume rm proxy-config        # 删数据卷（里面的 secret 一并清掉）
-sudo rm -f /etc/cron.d/mtproto-restart    # 删每日重启定时任务
-sudo docker rmi telegrammessenger/proxy   # 可选：连镜像一起删
+<p>当前服务器原有服务：</p>
+<table>
+<thead>
+<tr>
+<th>服务</th>
+<th>协议</th>
+<th>端口</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Caddy</td>
+<td>TCP</td>
+<td>80、443</td>
+</tr>
+<tr>
+<td>sing-box / HY2</td>
+<td>UDP</td>
+<td>443</td>
+</tr>
+<tr>
+<td>SSH</td>
+<td>TCP</td>
+<td>22</td>
+</tr>
+<tr>
+<td>Telegram MTProxy</td>
+<td>TCP</td>
+<td>8443</td>
+</tr>
+</tbody>
+</table>
+<p>特别注意：Caddy 使用 TCP 443，sing-box 使用 UDP 443，两者可以同时使用，不需要修改原有配置。</p>
+<h2 id="gcp-nat">三、GCP NAT 网络说明</h2>
+<p>GCP VM 使用公网 NAT，实例内部地址和公网地址不同。</p>
+<p>本次部署地址（示例值）：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>地址</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>VM 内网 IP</td>
+<td>10.128.0.2</td>
+</tr>
+<tr>
+<td>GCP 公网 IP</td>
+<td>203.0.113.10</td>
+</tr>
+<tr>
+<td>MTProxy 端口</td>
+<td>TCP 8443</td>
+</tr>
+</tbody>
+</table>
+<p>这是本次部署中最重要的技术调整。</p>
+<p>MTProxy 需要通过 <code>--nat-info</code> 告知自身内部地址和公网映射地址，否则可能出现 TCP 端口测试成功，但 Telegram 客户端无法正常完成连接的问题。</p>
+<p>正确参数：</p>
+<pre><code>--nat-info 10.128.0.2:203.0.113.10
 </code></pre>
-<p>然后到 GCP 控制台删掉 <code>allow-mtproto-443</code> 防火墙规则即可，不留开放端口。</p>
+<p>检查内网地址：</p>
+<pre><code>ip -4 route get 149.154.175.50
+</code></pre>
+<p>检查公网地址：</p>
+<pre><code>curl -4fsS https://api.ipify.org
+echo
+</code></pre>
+<p>如果更换公网 IP，需要同步修改 NAT 参数和客户端连接地址。</p>
+<p>建议在 GCP 中保留静态外部 IP，避免实例停止或重新启动后公网地址发生变化。</p>
+<h2 id="swap">四、增加 Swap</h2>
+<p>由于免费层级 VM 只有约 1GB 内存，为减少内存不足时进程被 OOM Killer 终止的风险，增加 512MB Swap。</p>
+<p>创建 Swap：</p>
+<pre><code>sudo fallocate -l 512M /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+</code></pre>
+<p>设置开机自动挂载：</p>
+<pre><code>echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+</code></pre>
+<p>设置 Swap 使用倾向：</p>
+<pre><code>echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-swap.conf
+sudo sysctl --system
+</code></pre>
+<p>检查：</p>
+<pre><code>free -h
+sudo /sbin/swapon --show
+</code></pre>
+<p>注意：Swap 文件使用现有系统磁盘空间，不需要另外创建 GCP 持久磁盘，不会因为创建 Swap 本身增加云磁盘容量。</p>
+<p>Swap 是内存不足时的缓冲，不是物理内存的替代品。如果持续大量使用 Swap，需要进一步检查内存压力。</p>
+<h2 id="_3">五、安装编译依赖</h2>
+<p>更新软件源：</p>
+<pre><code>sudo apt-get update
+</code></pre>
+<p>安装依赖：</p>
+<pre><code>sudo apt-get install -y \
+  git curl build-essential \
+  libssl-dev zlib1g-dev
+</code></pre>
+<h2 id="telegram">六、下载 Telegram 官方源码</h2>
+<p>官方项目：https://github.com/TelegramMessenger/MTProxy</p>
+<p>克隆源码：</p>
+<pre><code>sudo git clone --depth 1 \
+  https://github.com/TelegramMessenger/MTProxy.git \
+  /opt/MTProxy
+</code></pre>
+<p>由于使用 sudo 下载，源码目录归 root 所有。</p>
+<p>检查版本：</p>
+<pre><code>sudo git -C /opt/MTProxy rev-parse --short HEAD
+</code></pre>
+<p>实际部署提交：</p>
+<pre><code>69f2f08
+</code></pre>
+<h2 id="mtproxy">七、编译 MTProxy</h2>
+<p>进入源码目录：</p>
+<pre><code>cd /opt/MTProxy
+</code></pre>
+<p>考虑到 VM 只有约 1GB 内存，使用单线程编译：</p>
+<pre><code>sudo make -j1
+</code></pre>
+<p>检查编译结果：</p>
+<pre><code>ls -lh /opt/MTProxy/objs/bin/mtproto-proxy
+</code></pre>
+<p>实际生成文件 <code>/opt/MTProxy/objs/bin/mtproto-proxy</code>，文件大小约 508KB。</p>
+<h2 id="telegram_1">八、下载 Telegram 官方配置</h2>
+<p>进入源码目录：</p>
+<pre><code>cd /opt/MTProxy
+</code></pre>
+<p>下载官方 Secret 文件：</p>
+<pre><code>sudo curl -fsSL \
+  https://core.telegram.org/getProxySecret \
+  -o proxy-secret
+</code></pre>
+<p>下载官方服务器配置：</p>
+<pre><code>sudo curl -fsSL \
+  https://core.telegram.org/getProxyConfig \
+  -o proxy-multi.conf
+</code></pre>
+<p>检查文件：</p>
+<pre><code>wc -c proxy-secret proxy-multi.conf
+</code></pre>
+<p>实际部署结果：</p>
+<pre><code>128 proxy-secret
+821 proxy-multi.conf
+</code></pre>
+<p>检查配置结构：</p>
+<pre><code>grep -q '^default ' proxy-multi.conf \
+  &amp;&amp; echo &quot;default 配置存在&quot;
+
+grep -q '^proxy_for ' proxy-multi.conf \
+  &amp;&amp; echo &quot;proxy_for 配置存在&quot;
+</code></pre>
+<p>两个配置项均通过检查。</p>
+<p>注意：<code>proxy-secret</code> 是 MTProxy 用于连接 Telegram 后端的官方密钥文件，不是提供给用户的客户端 Secret。</p>
+<h2 id="secret">九、生成独立客户端 Secret</h2>
+<p>客户端 Secret 单独存放在 <code>/etc/mtproxy/</code>，不放在 Git 源码目录中。</p>
+<p>创建目录：</p>
+<pre><code>sudo install -d -m 700 /etc/mtproxy
+</code></pre>
+<p>生成 128 位随机 Secret：</p>
+<pre><code>sudo bash -c '
+umask 077
+printf &quot;CLIENT_SECRET=%s\n&quot; &quot;$(openssl rand -hex 16)&quot; \
+  &gt; /etc/mtproxy/mtproxy.env
+'
+</code></pre>
+<p>检查权限：</p>
+<pre><code>sudo stat -c '%a %U:%G %n' \
+  /etc/mtproxy \
+  /etc/mtproxy/mtproxy.env
+</code></pre>
+<p>预期：</p>
+<pre><code>700 root:root /etc/mtproxy
+600 root:root /etc/mtproxy/mtproxy.env
+</code></pre>
+<p>Secret 不要提交到 Git，不要公开分享。</p>
+<h2 id="systemd">十、配置 systemd 服务</h2>
+<p>创建服务文件：</p>
+<pre><code>sudo tee /etc/systemd/system/mtproxy.service &gt; /dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Telegram MTProxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/MTProxy
+EnvironmentFile=/etc/mtproxy/mtproxy.env
+
+ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy \
+  -u nobody \
+  -p 8888 \
+  -H 8443 \
+  -S ${CLIENT_SECRET} \
+  --aes-pwd /opt/MTProxy/proxy-secret \
+  /opt/MTProxy/proxy-multi.conf \
+  --nat-info 10.128.0.2:203.0.113.10 \
+  -M 1
+
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+</code></pre>
+<p>说明：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-u nobody</code></td>
+<td>以低权限用户运行</td>
+</tr>
+<tr>
+<td><code>-p 8888</code></td>
+<td>MTProxy 统计端口参数</td>
+</tr>
+<tr>
+<td><code>-H 8443</code></td>
+<td>客户端监听端口</td>
+</tr>
+<tr>
+<td><code>-S</code></td>
+<td>客户端连接 Secret</td>
+</tr>
+<tr>
+<td><code>--aes-pwd</code></td>
+<td>Telegram 官方后端密钥文件</td>
+</tr>
+<tr>
+<td><code>--nat-info</code></td>
+<td>GCP 内外网 NAT 映射</td>
+</tr>
+<tr>
+<td><code>-M 1</code></td>
+<td>一个 Worker</td>
+</tr>
+</tbody>
+</table>
+<p>检查 systemd 配置：</p>
+<pre><code>sudo systemd-analyze verify \
+  /etc/systemd/system/mtproxy.service
+</code></pre>
+<p>重新加载并启动：</p>
+<pre><code>sudo systemctl daemon-reload
+sudo systemctl enable --now mtproxy
+</code></pre>
+<p>检查状态：</p>
+<pre><code>sudo systemctl status mtproxy --no-pager
+</code></pre>
+<p>检查端口：</p>
+<pre><code>sudo ss -lntup | grep -E ':(8443|8888)\b'
+</code></pre>
+<p>查看日志：</p>
+<pre><code>sudo journalctl -u mtproxy -n 50 --no-pager
+</code></pre>
+<p>实际运行检查结果：</p>
+<ul>
+<li>systemd：active (running)</li>
+<li>开机启动：enabled</li>
+<li>MTProxy：以 nobody 身份运行</li>
+<li>TCP 8443：正常监听</li>
+<li>官方配置文件：成功加载</li>
+<li>Worker：1</li>
+</ul>
+<p>注意：<code>systemctl status</code> 和 <code>ps</code> 的完整输出可能包含启动参数中的客户端 Secret。不要将未经脱敏的完整输出公开。</p>
+<h2 id="gcp">十一、GCP 防火墙配置</h2>
+<p>在 GCP 控制台：VPC Network → Firewall → Create Firewall Rule。</p>
+<p>建议参数：</p>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>设置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>名称</td>
+<td>allow-mtproxy-8443</td>
+</tr>
+<tr>
+<td>方向</td>
+<td>Ingress</td>
+</tr>
+<tr>
+<td>操作</td>
+<td>Allow</td>
+</tr>
+<tr>
+<td>目标</td>
+<td>指定 MTProxy VM</td>
+</tr>
+<tr>
+<td>来源 IPv4</td>
+<td>0.0.0.0/0</td>
+</tr>
+<tr>
+<td>协议</td>
+<td>TCP</td>
+</tr>
+<tr>
+<td>端口</td>
+<td>8443</td>
+</tr>
+</tbody>
+</table>
+<p>只开放 TCP 8443。</p>
+<p>不要开放 TCP 8888，也不要修改原有 TCP 443、UDP 443 和 SSH 22 规则。</p>
+<h2 id="windows">十二、Windows 端口连通性测试</h2>
+<p>在 Windows PowerShell 执行：</p>
+<pre><code>Test-NetConnection 203.0.113.10 -Port 8443
+</code></pre>
+<p>实际测试结果：</p>
+<pre><code>ComputerName     : 203.0.113.10
+RemotePort       : 8443
+TcpTestSucceeded : True
+</code></pre>
+<p>说明公网 TCP 8443 已经可达。</p>
+<p>但是 TCP 测试成功不代表 Telegram 协议认证一定成功，还需要客户端实际连接验证。</p>
+<h2 id="gcp-nat_1">十三、GCP NAT 参数修复</h2>
+<p>第一次测试时，TCP 8443 可以连接，但 Telegram 客户端无法正常使用。</p>
+<p>检查发现内网地址与公网地址不一致（见第三节的地址表）。通过检查 MTProxy 帮助信息，确认当前版本支持：</p>
+<pre><code>--nat-info &lt;local-addr&gt;:&lt;global-addr&gt;
+</code></pre>
+<p>在 systemd 服务中增加：</p>
+<pre><code>--nat-info 10.128.0.2:203.0.113.10
+</code></pre>
+<p>重新加载并重启：</p>
+<pre><code>sudo systemctl daemon-reload
+sudo systemctl restart mtproxy
+</code></pre>
+<p>修改后 Telegram 客户端成功连接。</p>
+<p>这是本次部署最关键的故障排查和修复步骤。</p>
+<h2 id="telegram_2">十四、Telegram 客户端连接</h2>
+<p>客户端使用 MTProto 类型。</p>
+<p>连接参数：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Server</td>
+<td>GCP 公网 IP</td>
+</tr>
+<tr>
+<td>Port</td>
+<td>8443</td>
+</tr>
+<tr>
+<td>Secret</td>
+<td>客户端随机 Secret</td>
+</tr>
+</tbody>
+</table>
+<p>建议使用 Telegram 官方支持的随机填充模式。</p>
+<p>客户端 Secret 格式：</p>
+<pre><code>dd + 32位十六进制随机 Secret
+</code></pre>
+<p>生成连接链接：</p>
+<pre><code>sudo bash -c '
+source /etc/mtproxy/mtproxy.env
+printf &quot;tg://proxy?server=203.0.113.10&amp;port=8443&amp;secret=dd%s\n&quot; &quot;$CLIENT_SECRET&quot;
+'
+</code></pre>
+<p>这里的 Secret 必须使用当前 <code>/etc/mtproxy/mtproxy.env</code> 中的值。</p>
+<p>在 Windows 上打开生成的 Telegram 链接，导入 Telegram Desktop。</p>
+<p>验证：</p>
+<ol>
+<li>Telegram 显示代理已连接。</li>
+<li>能够正常收发文字消息。</li>
+<li>能够传输图片和文件。</li>
+<li>关闭并重新打开客户端后仍能连接。</li>
+<li>切换网络后重新测试。</li>
+</ol>
+<p>实际部署已经完成 Telegram 客户端连接验证。</p>
+<h2 id="telegram_3">十五、每日自动更新 Telegram 官方配置</h2>
+<p>Telegram 官方建议定期更新 <code>proxy-multi.conf</code>。</p>
+<p>采用 systemd timer，每天检查一次。</p>
+<p>更新脚本：</p>
+<pre><code>sudo tee /usr/local/sbin/mtproxy-refresh-config &gt; /dev/null &lt;&lt;'EOF'
+#!/bin/bash
+set -Eeuo pipefail
+
+CONFIG=&quot;/opt/MTProxy/proxy-multi.conf&quot;
+BACKUP=&quot;/opt/MTProxy/proxy-multi.conf.bak&quot;
+URL=&quot;https://core.telegram.org/getProxyConfig&quot;
+
+TMP=$(mktemp /opt/MTProxy/.proxy-config.XXXXXX)
+trap 'rm -f &quot;$TMP&quot;' EXIT
+
+logger -t mtproxy-update &quot;开始检查 Telegram 官方配置&quot;
+
+if ! curl -fLsS \
+    --connect-timeout 10 \
+    --max-time 60 \
+    --retry 2 \
+    &quot;$URL&quot; -o &quot;$TMP&quot;; then
+    logger -t mtproxy-update &quot;下载失败，保留旧配置&quot;
+    exit 1
+fi
+
+if [ &quot;$(wc -c &lt; &quot;$TMP&quot;)&quot; -lt 64 ] ||
+   ! grep -q '^default ' &quot;$TMP&quot; ||
+   ! grep -q '^proxy_for ' &quot;$TMP&quot;; then
+    logger -t mtproxy-update &quot;配置验证失败，保留旧配置&quot;
+    exit 1
+fi
+
+if cmp -s &quot;$TMP&quot; &quot;$CONFIG&quot;; then
+    logger -t mtproxy-update &quot;配置没有变化，无需重启&quot;
+    exit 0
+fi
+
+cp -a &quot;$CONFIG&quot; &quot;$BACKUP&quot;
+
+install -o root -g root -m 0644 &quot;$TMP&quot; &quot;${CONFIG}.new&quot;
+mv -f &quot;${CONFIG}.new&quot; &quot;$CONFIG&quot;
+
+if systemctl restart mtproxy &amp;&amp;
+   systemctl is-active --quiet mtproxy; then
+    logger -t mtproxy-update &quot;配置更新成功，MTProxy 已重启&quot;
+else
+    cp -a &quot;$BACKUP&quot; &quot;$CONFIG&quot;
+    systemctl restart mtproxy || true
+    logger -t mtproxy-update &quot;更新后服务异常，已尝试恢复旧配置&quot;
+    exit 1
+fi
+EOF
+
+sudo chmod 700 /usr/local/sbin/mtproxy-refresh-config
+</code></pre>
+<p>更新脚本特点：</p>
+<ul>
+<li>下载失败不覆盖原配置。</li>
+<li>检查文件长度。</li>
+<li>检查 <code>default</code> 和 <code>proxy_for</code> 配置项。</li>
+<li>配置没有变化时不重启。</li>
+<li>更新前备份旧配置。</li>
+<li>重启异常时尝试恢复旧配置。</li>
+</ul>
+<p>注意：这是基础完整性检查，不等于完整的配置语义校验；自动恢复也需要通过后续日志和服务状态监控确认。</p>
+<p>创建 systemd service：</p>
+<pre><code>sudo tee /etc/systemd/system/mtproxy-refresh-config.service &gt; /dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Refresh Telegram MTProxy configuration
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mtproxy-refresh-config
+EOF
+</code></pre>
+<p>创建每日 timer：</p>
+<pre><code>sudo tee /etc/systemd/system/mtproxy-refresh-config.timer &gt; /dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Daily Telegram MTProxy configuration refresh
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=mtproxy-refresh-config.service
+
+[Install]
+WantedBy=timers.target
+EOF
+</code></pre>
+<p>检查配置：</p>
+<pre><code>sudo systemd-analyze verify \
+  /etc/systemd/system/mtproxy-refresh-config.service \
+  /etc/systemd/system/mtproxy-refresh-config.timer
+</code></pre>
+<p>手动测试：</p>
+<pre><code>sudo /usr/local/sbin/mtproxy-refresh-config
+</code></pre>
+<p>查看更新日志：</p>
+<pre><code>sudo journalctl -t mtproxy-update -n 20 --no-pager
+</code></pre>
+<p>启用定时器：</p>
+<pre><code>sudo systemctl daemon-reload
+sudo systemctl enable --now mtproxy-refresh-config.timer
+</code></pre>
+<p>检查：</p>
+<pre><code>systemctl list-timers mtproxy-refresh-config.timer
+</code></pre>
+<p>实际手动更新成功，定时器也已成功启用。</p>
+<p>本次设置的计划执行时间为每天 UTC 04:17，另有最多 5 分钟随机延迟。</p>
+<h2 id="_4">十六、日常维护命令</h2>
+<p>查看 MTProxy 状态：</p>
+<pre><code>sudo systemctl is-active mtproxy
+</code></pre>
+<p>查看开机启动状态：</p>
+<pre><code>sudo systemctl is-enabled mtproxy
+</code></pre>
+<p>查看日志：</p>
+<pre><code>sudo journalctl -u mtproxy -n 50 --no-pager
+</code></pre>
+<p>实时日志：</p>
+<pre><code>sudo journalctl -u mtproxy -f
+</code></pre>
+<p>检查监听端口：</p>
+<pre><code>sudo ss -lntup | grep -E ':(8443|8888)\b'
+</code></pre>
+<p>检查每日更新任务：</p>
+<pre><code>sudo systemctl is-active mtproxy-refresh-config.timer
+</code></pre>
+<p>查看下次更新：</p>
+<pre><code>systemctl list-timers mtproxy-refresh-config.timer
+</code></pre>
+<p>查看更新日志：</p>
+<pre><code>sudo journalctl -t mtproxy-update -n 30 --no-pager
+</code></pre>
+<p>查看内存：</p>
+<pre><code>free -h
+</code></pre>
+<p>查看 Swap：</p>
+<pre><code>sudo /sbin/swapon --show
+</code></pre>
+<h2 id="gcp_1">十七、GCP 免费层级与资源注意事项</h2>
+<p>本次部署使用已有 VM，没有新增实例，也没有新增 GCP 持久磁盘。</p>
+<p>Docker 已安装，但 MTProxy 直接运行官方源码编译后的程序，不需要 Docker 容器常驻。</p>
+<p>需要关注：</p>
+<ol>
+<li>MTProxy 流量直接经过 GCP VM，不经过 Cloudflare CDN。</li>
+<li>GCP 免费额度有区域、流量和资源使用条件，不能认为所有 MTProxy 流量都免费。</li>
+<li>512MB Swap 占用现有系统磁盘空间。</li>
+<li>MTProxy 当前使用一个 Worker。</li>
+<li>约 1GB RAM 的 VM 应持续监控内存和 Swap。</li>
+<li>不建议在该 VM 上安装额外的容器管理面板。</li>
+<li>不建议为了 MTProxy 修改现有 sing-box、HY2 和 Caddy 配置。</li>
+</ol>
+<h2 id="_5">十八、最终部署状态</h2>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Telegram 官方源码</td>
+<td>已下载</td>
+</tr>
+<tr>
+<td>官方源码编译</td>
+<td>成功</td>
+</tr>
+<tr>
+<td>官方配置下载</td>
+<td>成功</td>
+</tr>
+<tr>
+<td>客户端 Secret</td>
+<td>已生成并轮换</td>
+</tr>
+<tr>
+<td>systemd 服务</td>
+<td>正常运行</td>
+</tr>
+<tr>
+<td>运行权限</td>
+<td>nobody</td>
+</tr>
+<tr>
+<td>NAT 参数</td>
+<td>已配置</td>
+</tr>
+<tr>
+<td>TCP 8443</td>
+<td>公网可达</td>
+</tr>
+<tr>
+<td>GCP 防火墙</td>
+<td>已放行</td>
+</tr>
+<tr>
+<td>Telegram 客户端</td>
+<td>已成功连接</td>
+</tr>
+<tr>
+<td>开机自动启动</td>
+<td>已启用</td>
+</tr>
+<tr>
+<td>异常自动重启</td>
+<td>已配置</td>
+</tr>
+<tr>
+<td>每日配置更新</td>
+<td>已启用</td>
+</tr>
+<tr>
+<td>配置备份</td>
+<td>已配置</td>
+</tr>
+<tr>
+<td>Swap</td>
+<td>512MB，已启用</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_6">十九、最终架构</h2>
+<pre><code>GCP Debian 12 VPS
+│
+├── Caddy
+│   ├── TCP 80
+│   └── TCP 443
+│
+├── sing-box
+│   └── UDP 443
+│
+├── Telegram MTProxy
+│   ├── 官方源码编译
+│   ├── systemd 管理
+│   ├── TCP 8443
+│   ├── NAT 映射配置
+│   └── 单 Worker
+│
+├── MTProxy 配置维护
+│   ├── 每日下载官方配置
+│   ├── 配置完整性检查
+│   ├── 变化检测
+│   ├── 自动备份
+│   └── 更新后重启
+│
+└── 系统资源
+    ├── 约 1GB RAM
+    ├── 512MB Swap
+    └── 30GB 系统磁盘
+</code></pre>
+<p><strong>总结：</strong></p>
+<p>本方案最终采用 Telegram 官方源码 + systemd，而不是 Docker 镜像运行。</p>
+<p>通过独立 TCP 8443、GCP NAT 参数、客户端独立 Secret 和每日自动更新机制，实现了与现有 Caddy、sing-box、HY2 服务共存的 Telegram MTProxy 部署。</p>
+<p>后续主要维护源码版本、Telegram 官方配置、Secret 安全、GCP 出站流量以及服务器内存使用情况。</p>
+<h2 id="_7">二十、关键经验</h2>
+<ol>
+<li><strong>GCP NAT 是关键</strong>：<code>--nat-info</code> 是实际解决「TCP 通但客户端连不上」的关键修复，应作为独立章节，而不是简单的一条启动参数。</li>
+<li><strong>Docker 不一定是最佳选择</strong>：官方镜像较旧，最终采用官方源码编译更合适；Docker 保留安装，但不参与 MTProxy 的实际运行。</li>
+<li><strong>端口共存</strong>：TCP 443 与 UDP 443 可以同时使用（Caddy 与 sing-box 互不干扰），MTProxy 使用独立的 TCP 8443，零改动现有服务。</li>
+<li><strong>自动更新要有保护</strong>：不应直接覆盖配置文件，必须先下载、检查、备份，再替换，异常时回滚。</li>
+<li><strong>两个保留事项</strong>：目前自动更新脚本是基础检查和重启回滚，并不是真正的端到端健康检查，后续可以增强为检查进程、监听端口和 Telegram 后端连接状态；另外 <code>systemctl status mtproxy</code> 可能显示启动参数中的 Secret，发布截图或日志时必须脱敏。</li>
+</ol>
 <footer>本文所有 IP、secret 均为示例占位，请替换为你自己的；代理链接含 secret，请勿公开发布。本文为个人运维记录，使用云服务请遵守服务商条款。</footer>
 </div>
 </body>
