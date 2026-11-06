@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GCP 上搭建 Telegram MTProto 代理</title>
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --border:#30363d;
+  --text:#e6edf3; --muted:#9aa7b4; --accent:#58a6ff; --accent2:#3fb950;
+  --code-bg:#0b0f14;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  line-height:1.75;}
+.wrap{max-width:880px;margin:0 auto;padding:28px 20px 64px}
+header.site{padding:28px 0 8px;border-bottom:1px solid var(--border);margin-bottom:8px}
+header.site h1{font-size:28px;margin:0 0 6px;line-height:1.35}
+header.site .sub{color:var(--muted);font-size:14px;margin:0}
+h1{font-size:26px;margin:34px 0 12px;padding-top:18px;border-top:1px solid var(--border)}
+header.site h1{border-top:none;padding-top:0}
+h2{font-size:20px;margin:26px 0 10px;color:var(--accent)}
+h3{font-size:16px;margin:20px 0 8px}
+p{margin:10px 0}
+a{color:var(--accent)}
+ul,ol{padding-left:24px}
+li{margin:5px 0}
+code{background:var(--code-bg);border:1px solid var(--border);border-radius:5px;
+  padding:1px 5px;font-size:.88em;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;
+  padding:14px 16px;overflow-x:auto}
+pre code{background:none;border:none;padding:0;font-size:13px;line-height:1.6}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px;display:block;overflow-x:auto}
+th,td{border:1px solid var(--border);padding:7px 10px;text-align:left;white-space:nowrap}
+th{background:var(--panel)}
+blockquote{margin:14px 0;padding:10px 16px;border-left:3px solid var(--accent2);
+  background:var(--panel);color:var(--text);border-radius:0 8px 8px 0}
+blockquote p{margin:4px 0}
+hr{border:none;border-top:1px solid var(--border);margin:26px 0}
+footer{margin-top:44px;padding-top:16px;border-top:1px solid var(--border);
+  color:var(--muted);font-size:13px}
+strong{color:#fff}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="site">
+<h1>✈️ GCP 上搭建 Telegram MTProto 代理</h1>
+<p class="sub">在自己的 GCP 虚拟机上用官方镜像搭一个 Telegram 专用代理：防火墙、Docker、secret、导入验证、运维与排障全记录（已脱敏，可公开）</p>
+</header>
+
+<blockquote>
+<p>在自己的 GCP 虚拟机（Debian 12）上用官方 MTProxy 镜像搭一个 Telegram 专用代理：给自己和信得过的人多一条连 Telegram 的路。本文命令均在 Debian 12 上适用，照着从上往下执行即可。</p>
+</blockquote>
+<h2 id="_1">一、这是什么 / 先说清的几件事</h2>
+<ul>
+<li><strong>MTProto 代理</strong>是 Telegram 官方协议的专用代理，只能代理 Telegram 流量，不能当通用代理用。官方软件由 Telegram 团队维护（TelegramMessenger/MTProxy），有现成的 Docker 镜像。</li>
+<li><strong>装在哪</strong>：自己的 GCP VM（本文以一台 Debian 12 的小机器为例）。它是独立的 Docker 容器，和机器上其他服务（比如已有的节点）互不影响，不用了删容器即净。</li>
+<li><strong>合规与成本</strong>：GCP 不禁止个人运行代理类软件。代理转发算普通出站流量——注意你实例的出站计费档位和免费额度，自己用离上限很远；<strong>真正的风险只有链接泄露被滥用刷流量</strong>，所以文中的 secret 只发给信得过的人，绝不公开。</li>
+<li><strong>资源占用</strong>：极小，常驻内存十几 MB，1 GB 内存的小机器也毫无压力。</li>
+</ul>
+<h2 id="_2">二、前置条件</h2>
+<ul>
+<li>一台能 SSH 登录的 GCP VM（Debian 12），有一个公网 IP</li>
+<li>你的账号对该 VM 有 sudo 权限，对 GCP 项目有改防火墙的权限</li>
+<li>本地装有 Telegram 客户端（手机或桌面均可）用于导入和验证</li>
+</ul>
+<h2 id="1gcp-443tcp">三、步骤 1：GCP 防火墙放行 443/TCP</h2>
+<p>代理监听 443 端口（看起来像普通 HTTPS 流量），先在云端放行。</p>
+<p><strong>控制台操作</strong>：GCP 控制台 → VPC 网络 → 防火墙 → 创建防火墙规则：</p>
+<ul>
+<li>名称：<code>allow-mtproto-443</code></li>
+<li>方向：入站；对匹配项执行的操作：允许</li>
+<li>目标：网络中的所有实例（或用目标标记只圈你的实例）</li>
+<li>来源 IPv4 范围：<code>0.0.0.0/0</code></li>
+<li>协议和端口：TCP，<code>443</code></li>
+</ul>
+<p><strong>或用 gcloud 命令</strong>（在本机装有 gcloud 的终端执行）：</p>
+<pre><code class="language-bash">gcloud compute firewall-rules create allow-mtproto-443 \
+  --allow tcp:443 --direction INGRESS --priority 1000 --network default
+</code></pre>
+<blockquote>
+<p>如果机器上 443 已被其他服务占用，换一个端口（比如 8443），后面所有出现 443 的地方同步替换，防火墙也放行对应端口。</p>
+</blockquote>
+<h2 id="2-docker">四、步骤 2：安装 Docker</h2>
+<p>SSH 登录 VM 后执行（已装 Docker 的跳过本节，用 <code>docker --version</code> 验证）：</p>
+<pre><code class="language-bash">curl -fsSL https://get.docker.com | sudo sh
+sudo systemctl enable --now docker
+docker --version
+</code></pre>
+<p>能输出版本号即安装成功。官方安装脚本会把 Docker 设为开机自启。</p>
+<h2 id="3-secret">五、步骤 3：生成 secret 并启动代理</h2>
+<p>先生成一个固定 secret（32 位十六进制）。<strong>固定 secret 的好处</strong>：代理链接由你自己拼，不依赖容器日志，重启也不变：</p>
+<pre><code class="language-bash">openssl rand -hex 16
+</code></pre>
+<p>把输出记下来（例如 <code>0123456789abcdef0123456789abcdef</code>，下文以 <code>&lt;SECRET&gt;</code> 代指）。然后启动官方镜像：</p>
+<pre><code class="language-bash">sudo docker run -d --name mtproto --restart unless-stopped \
+  -e SECRET=&lt;SECRET&gt; \
+  -p 443:443 \
+  telegrammessenger/proxy
+</code></pre>
+<ul>
+<li><code>--restart unless-stopped</code>：机器重启后容器自动恢复</li>
+<li>想给不同的人发不同的 secret（便于单独吊销），<code>-e SECRET=</code> 后面可以用英文逗号分隔多个 secret</li>
+<li>不写 <code>-e SECRET</code> 也能跑：容器会随机生成并在日志里打印链接，但重启后排查麻烦，不推荐</li>
+</ul>
+<p>确认容器起来了：</p>
+<pre><code class="language-bash">sudo docker ps
+</code></pre>
+<p>看到 <code>mtproto</code> 处于 <code>Up</code> 状态即可。</p>
+<h2 id="4-telegram">六、步骤 4：拼出代理链接并导入 Telegram</h2>
+<p>先在 VM 上查公网 IP：</p>
+<pre><code class="language-bash">curl -s ifconfig.me
+</code></pre>
+<p>代理链接格式（把 <code>&lt;公网IP&gt;</code> 和 <code>&lt;SECRET&gt;</code> 换成你的）：</p>
+<pre><code>tg://proxy?server=&lt;公网IP&gt;&amp;port=443&amp;secret=&lt;SECRET&gt;
+</code></pre>
+<p>同样的内容也有网页版链接，适合发给别人：</p>
+<pre><code>https://t.me/proxy?server=&lt;公网IP&gt;&amp;port=443&amp;secret=&lt;SECRET&gt;
+</code></pre>
+<p><strong>导入方法</strong>：</p>
+<ul>
+<li>手机 Telegram：直接点开 <code>tg://</code> 链接（或打开 t.me 链接），客户端会弹出「启用代理」确认框，点启用</li>
+<li>桌面 Telegram：设置 → 高级 → 网络与代理 → 添加代理 → 选 MTProto → 填服务器、端口、secret</li>
+</ul>
+<h2 id="5">七、步骤 5：验证</h2>
+<ol>
+<li>客户端里代理状态显示已连接（桌面版设置里能看到延迟毫秒数）</li>
+<li>随便给一个联系人发条消息、再打开一个频道拉新消息，能收发即通</li>
+<li>VM 上看一眼容器日志，没有报错刷屏即正常：</li>
+</ol>
+<pre><code class="language-bash">sudo docker logs --tail 20 mtproto
+</code></pre>
+<h2 id="_3">八、日常运维命令速查</h2>
+<p>```bash
+sudo docker ps                          # 看状态
+sudo docker logs -f mtproto             # 实时日志（Ctrl+C 退出）
+s
+...[truncated 2089 chars]</p>
+<footer>本文所有 IP、secret 均为示例占位，请替换为你自己的；代理链接含 secret，请勿公开发布。本文为个人运维记录，使用云服务请遵守服务商条款。</footer>
+</div>
+</body>
+</html>
